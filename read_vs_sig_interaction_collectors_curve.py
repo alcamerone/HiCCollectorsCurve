@@ -1,47 +1,126 @@
 import argparse
+import random
+from sets import Set
 
 def main(args):
 	#Build significance matrix
 	probes = open(args.probe_list_fp, 'r')
 	probes.readline() #Skip headers
-	probe_index = {} #Create dictionary of indices to probes
+	probe_index = {} #Links probes to indices (used for building significance matrix quickly)
+	chr_index = {} #Links the chromosome identifier to the first index of a probe on this chromosome (i.e. the left-most probe of the chromosome)
+	chr_bins = {} #Links the chromosome identifier to an ordered list of comma-separated tuples representing bins on the chromosome
+	probe_list = [] #Simple list of probes for printing
+	chr_list = [] #Simple list of chromosomes (FOR TESTING)
+	
 	print "Indexing probes..."
+	curr_chr = "" #The chromosome we are indexing currently
 	for index,line in enumerate(probes):
-		probe_index[line.split('\t')[0]] = index #Build index-probe dict
+		probe = line.split('\t')
+		if curr_chr == "" or curr_chr != line[0:4]:
+			curr_chr = line[0:4]
+			chr_index[curr_chr] = index
+			chr_list.append(curr_chr)
+		probe_index[probe[0]] = index #Build index-probe dict
+		probe_list.append(probe[0])
+		if not chr_bins.has_key(curr_chr):
+			chr_bins[curr_chr] = [probe[2] + "," + probe[3]]
+		else:
+			chr_bins[curr_chr].append(probe[2] + "," + probe[3])
 	probes.close()
+	
 	print "Initialising significance matrix..."
 	sig_matrix = [[False for i in xrange(len(probe_index.keys()))] for j in xrange(len(probe_index.keys()))] #Create significance matrix
-	#for i in range(0,len(probe_index.keys())): #Initialise with False values
-	#	print "Initialising row " + str(i)
-	#	sig_matrix.append([False] * len(probe_index.keys()))
-		#for j in range (0,len(probe_index.keys())):
-		#	print "Initialising row " + str(i) + " col " + str(j)
-		#	sig_matrix[-1].append(False)
 	
-	sig_ints = open(args.sig_ints_fp, 'r') #Identify interactions as significant
+	#Identify interactions as significant
+	sig_ints = open(args.sig_ints_fp, 'r')
 	print "Identifying significant interactions..."
 	sig_ints.readline()
 	for i,line in enumerate(sig_ints):
-		print "Processing line " + str(i)
 		sig_int = line.strip().split('\t')
 		probe1 = sig_int[0]
 		probe2 = sig_int[4]
-		sig_matrix[probe_index[probe1]][probe_index[probe2]] = True #If an interaction between probe 1 and probe 2 appears, set the corresponding value in the matrix to True
-		sig_matrix[probe_index[probe2]][probe_index[probe1]] = True #Do this for probe 2 and probe 1 value as well
+		if probe_index.has_key(probe1) and probe_index.has_key(probe2):
+			sig_matrix[probe_index[probe1]][probe_index[probe2]] = True #If an interaction between probe 1 and probe 2 appears, set the corresponding value in the matrix to True
+			sig_matrix[probe_index[probe2]][probe_index[probe1]] = True #Do this for probe 2 and probe 1 value as well
 	sig_ints.close()
 	
+	sam_file = open(args.sam_file_fp, 'r')
+	line = sam_file.readline()
+	while line[0] == '@':
+		line = sam_file.readline()
+	reads = sam_file.readlines()
+	reads.insert(0,line)
+	results = []
+	for size in [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9]:
+		results.append(subsample_and_compare(sig_matrix,reads,size,len(probe_index.keys()),chr_index,chr_bins))
+	
+	"""for chr in chr_list:
+		print chr + ": "
+		for index,bin in enumerate(chr_bins[chr]):
+			print "Bin " + bin + " links to probe " + probe_list[chr_index[chr]+index]
+		
 	sig_matrix_test = open("sig_matrix_test.txt",'w')
 	print "Writing test file..."
+	for probe in probe_list:
+		sig_matrix_test.write('\t' + probe)
+	sig_matrix_test.write('\n')
 	for row in range(0,len(sig_matrix)):
+		sig_matrix_test.write(probe_list[row])
 		for col in sig_matrix[row]:
 			sig_matrix_test.write(str(col) + '\t')
 		sig_matrix_test.write('\n')
-	sig_matrix_test.close()
+	sig_matrix_test.close()"""
+
+def subsample_and_compare(sig_matrix,sam_reads,size,sig_ints,chr_index,chr_bins):
+	seen = Set([]) #Keeps track of which lines have been seen
+	hit = Set([]) #Keeps track of which significant interactions have been seen
+	num_runs = int(len(sam_reads)*size)
+	while num_runs > 0:
+		line_num = random.randint(0,len(sam_reads)-1)
+		if line_num not in seen:
+			seen.add(line_num)
+			read = sam_reads[line_num].split('\t')
+			chr1 = "Chr" + read[2]
+			pos1 = read[3]
+			if read[6] == '=':
+				chr2 = chr1
+			else:
+				chr2 = "Chr" + read[6]
+			pos2 = read[7]
+			indices1 = chr_index[chr1] + search_bins(chr_bins[chr1],0,len(chr_bins[chr1])-1,pos1)
+			indices2 = chr_index[chr2] + search_bins(chr_bins[chr2],pos2)
+			for index1 in indices1:
+				for index2 in indices2:
+					if not str(index1) + ',' + str(index2) in hit:
+						if sig_matrix[index1][index2]:
+							hit.add(str(index1) + ',' + str(index2))
+							hit.add(str(index2) + ',' + str(index1)) #As this is equivalent
+			num_runs -= 1
+	return float(hit/2)/float(sig_ints) #Divide the number of hit significant interactions by two, as they were added "twice" to the set, then divide by the total number of significant interactions to get the proportion of significant interactions hit by the reads in this subsample
+
+def search_bins(bins,start,end,pos):
+	bin_index = end+((start-end)/2)
+	bin = bins[bin_index].split(',')
+	if pos >= bin[0] and pos <= bin[1]:
+		result = [bin_index]
+		if not bin_index == 0:
+			adj_bin = bins[bin_index-1].split(',')	#Due to the overlapping nature of the bins, every read will hit either the previous or the next bin as well as the first found bin
+			if pos >= adj_bin[0] and pos <= adj_bin[1]:
+				result.append(bin_index-1)
+		if not bin_index == len(bins)-1:
+			adj_bin = bins[bin_index+1].split(',')
+			if pos >= adj_bin[0] and pos <= adj_bin[1]:
+				result.append(bin_index+1)
+		return result
+	elif pos < bin[0]:
+		return search_bins(bins,start,bin_index,pos)
+	elif pos > bin[1]:
+		return search_bins(bins,bin_index+1,end,pos) #Infinite loop?
 
 
 parser = argparse.ArgumentParser(description="")
 parser.add_argument("-p","--probe_list_fp")
-parser.add_argument("-s","--sig_ints_fp")
-#parser.add_argument("-s","--sam_file_fp")
+parser.add_argument("-i","--sig_ints_fp")
+parser.add_argument("-s","--sam_file_fp")
 args = parser.parse_args()
 main(args)
