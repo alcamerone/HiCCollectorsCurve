@@ -56,8 +56,7 @@ def main(args):
 	results = []
 	ss_sizes = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9]
 	print "Performing subsampling..."
-	for size in ss_sizes:
-		subsample_sam(reads,size,args.num_iter,args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/")
+	subsample_sam(reads,ss_sizes,args.num_iter,args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/")
 	print "Processing subsamples..."
 	proportion_sig_ints = process_subsamples(args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/",ss_sizes,chr_bins,chr_index,sig_matrix,num_sig_ints,probe_list)
 	mean_proportion_sig_ints = {}
@@ -65,12 +64,7 @@ def main(args):
 		mean_proportion_sig_ints[key] = sum(proportion_sig_ints[key])/float(args.num_iter)
 	print mean_proportion_sig_ints
 	
-	"""for chr in chr_list:
-		print chr + ": "
-		for index,bin in enumerate(chr_bins[chr]):
-			print "Bin " + bin + " links to probe " + probe_list[chr_index[chr]+index]
-	"""	
-	sig_matrix_test = open("sig_matrix_test.txt",'w')
+	"""sig_matrix_test = open("sig_matrix_test.txt",'w')
 	print "Writing test file..."
 	for probe in probe_list:
 		sig_matrix_test.write('\t' + probe)
@@ -80,30 +74,34 @@ def main(args):
 		for col in sig_matrix[row]:
 			sig_matrix_test.write('\t' + str(col))
 		sig_matrix_test.write('\n')
-	sig_matrix_test.close()
+	sig_matrix_test.close()"""
 	
-def subsample_sam(reads,size,num_times,temp_dir): #num_times: the number of times to subsample the SAM file
+def subsample_sam(reads,sizes,num_times,temp_dir): #num_times: the number of times to subsample the SAM file
 	if not os.path.exists(temp_dir):
 		print "Creating directory..."
 		os.mkdir(temp_dir)
 		print "Directory created."
-	temp_dir = temp_dir + str(size) + '/' #Include a subdirectory for each group of subsamples
-	if not os.path.exists(temp_dir):
-		print "Creating directory..."
-		os.mkdir(temp_dir)
-		print "Directory created."
-	num_runs = int(size*len(reads)) #The number of lines to pull from the SAM file
-	for i in range(int(num_times)):
-		seen = Set([]) #Keeps track of which lines have been seen
-		curr_run = 0
-		file_out = open(temp_dir + str(size) + "_subsample_" + str(i) + ".txt", 'w')
-		while curr_run < num_runs:
-			line_num = random.randint(0,len(reads)-1)
-			if not line_num in seen:
-				seen.add(line_num)
-				file_out.write(reads[line_num])
-				curr_run += 1
-		file_out.close()
+	for size in sizes:
+		temp_sub_dir = temp_dir + str(size) + '/' #Include a subdirectory for each group of subsamples
+		if not os.path.exists(temp_sub_dir):
+			print "Creating directory..."
+			os.mkdir(temp_sub_dir)
+			print "Directory created."
+		num_runs = int(size*len(reads)) #The number of lines to pull from the SAM file
+		for i in range(int(num_times)):
+			generate_subsample(temp_sub_dir,reads,num_runs,i,size)
+
+def generate_subsample(temp_dir,reads,num_reads,run_num,size):
+	seen = Set([]) #Keeps track of which lines have been seen
+	curr_run = 0
+	file_out = open(temp_dir + str(size) + "_subsample_" + str(run_num) + ".txt", 'w')
+	while curr_run < num_reads:
+		line_num = random.randint(0,len(reads)-1)
+		if not line_num in seen:
+			seen.add(line_num)
+			file_out.write(reads[line_num])
+			curr_run += 1
+	file_out.close()
 		
 def process_subsamples(temp_dir,sizes,chr_bins,chr_index,sig_matrix,sig_ints,probe_list):
 	proportion_sig_ints = {} #Keeps track of the proportions for each iteration of each subsample size
@@ -126,8 +124,10 @@ def process_subsamples(temp_dir,sizes,chr_bins,chr_index,sig_matrix,sig_ints,pro
 					chr2 = "Chr" + read[6]
 				pos2 = read[7]
 				if (chr_bins.has_key(chr1) and chr_bins.has_key(chr2)) and (chr_index.has_key(chr1) and chr_index.has_key(chr2)):
-					indices1 = search_bins(chr_bins[chr1],0,len(chr_bins[chr1])-1,pos1)
-					indices2 = search_bins(chr_bins[chr2],0,len(chr_bins[chr1])-1,pos2)
+					indices1 = search_bins(chr_bins[chr1],0,len(chr_bins[chr1])-1,int(pos1))
+					print indices1
+					indices2 = search_bins(chr_bins[chr2],0,len(chr_bins[chr1])-1,int(pos2))
+					print indices2
 					for index1 in indices1:
 						index1 += chr_index[chr1]
 						for index2 in indices2:
@@ -144,52 +144,23 @@ def process_subsamples(temp_dir,sizes,chr_bins,chr_index,sig_matrix,sig_ints,pro
 			sample.close()
 	return proportion_sig_ints
 
-"""def subsample_and_compare(sig_matrix,sam_reads,size,sig_ints,chr_index,chr_bins):
-	seen = Set([]) #Keeps track of which lines have been seen
-	hit = Set([]) #Keeps track of which significant interactions have been seen
-	num_runs = int(len(sam_reads)*size)
-	while num_runs > 0:
-		line_num = random.randint(0,len(sam_reads)-1)
-		if line_num not in seen:
-			seen.add(line_num)
-			read = sam_reads[line_num].split('\t')
-			chr1 = "Chr" + read[2]
-			pos1 = read[3]
-			if read[6] == '=':
-				chr2 = chr1
-			else:
-				chr2 = "Chr" + read[6]
-			pos2 = read[7]
-			indices1 = search_bins(chr_bins[chr1],0,len(chr_bins[chr1])-1,pos1)
-			indices2 = search_bins(chr_bins[chr2],pos2)
-			for index1 in indices1:
-				index1 += chr_index[chr1]
-				for index2 in indices2:
-					index2 += chr_index[chr2]
-					if not str(index1) + ',' + str(index2) in hit:
-						if sig_matrix[index1][index2]:
-							hit.add(str(index1) + ',' + str(index2))
-							hit.add(str(index2) + ',' + str(index1)) #As this is equivalent
-			num_runs -= 1
-	return float(hit/2)/float(sig_ints) #Divide the number of hit significant interactions by two, as they were added "twice" to the set, then divide by the total number of significant interactions to get the proportion of significant interactions hit by the reads in this subsample"""
-
 def search_bins(bins,start,end,pos):
 	bin_index = start+((end-start)/2)
 	bin = bins[bin_index].split(',')
-	if pos >= bin[0] and pos <= bin[1]:
+	if pos >= int(bin[0]) and pos <= int(bin[1]):
 		result = [bin_index]
 		if not bin_index == 0:
 			adj_bin = bins[bin_index-1].split(',')	#Due to the overlapping nature of the bins, every read will hit either the previous or the next bin as well as the first found bin
-			if pos >= adj_bin[0] and pos <= adj_bin[1]:
+			if pos >= int(adj_bin[0]) and pos <= int(adj_bin[1]):
 				result.append(bin_index-1)
 		if not bin_index == len(bins)-1:
 			adj_bin = bins[bin_index+1].split(',')
-			if pos >= adj_bin[0] and pos <= adj_bin[1]:
+			if pos >= int(adj_bin[0]) and pos <= int(adj_bin[1]):
 				result.append(bin_index+1)
 		return result
-	elif pos < bin[0]:
+	elif pos < int(bin[0]):
 		return search_bins(bins,start,bin_index,pos)
-	elif pos > bin[1]:
+	elif pos > int(bin[1]):
 		return search_bins(bins,bin_index+1,end,pos) #Infinite loop?
 
 
