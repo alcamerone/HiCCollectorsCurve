@@ -1,23 +1,29 @@
 import argparse
 import random
 import os
-from multiprocessing import Pool
+from multiprocessing import Pool, Manager
 from sets import Set
 
 chr_index = {} #Links the chromosome identifier to the first index of a probe on this chromosome (i.e. the left-most probe of the chromosome)
 chr_bins = {} #Links the chromosome identifier to an ordered list of comma-separated tuples representing bins on the chromosome
 reads = [] #Stores the list of SAM reads
+sig_matrix = []
+num_sig_ints = 0
+proportion_sig_ints = {} #Keeps track of the proportions for each iteration of each subsample size
 
 def main(args):
+	global chr_index
+	global chr_bins
+	global reads
+	global sig_matrix
+	global num_sig_ints
+	
 	#Build significance matrix
 	probes = open(args.probe_list_fp, 'r')
 	probes.readline() #Skip headers
 	probe_index = {} #Links probes to indices (used for building significance matrix quickly)
 	probe_list = [] #Simple list of probes for printing
 	chr_list = [] #Simple list of chromosomes (FOR TESTING)
-	global chr_index
-	global chr_bins
-	global reads
 	
 	print "Indexing probes..."
 	curr_chr = "" #The chromosome we are indexing currently
@@ -40,7 +46,6 @@ def main(args):
 	
 	#Identify interactions as significant
 	sig_ints = open(args.sig_ints_fp, 'r')
-	num_sig_ints = 0
 	print "Identifying significant interactions..."
 	sig_ints.readline()
 	for line in sig_ints:
@@ -64,10 +69,17 @@ def main(args):
 	print "Performing subsampling..."
 	subsample_sam(ss_sizes,args.num_iter,args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/",args.num_threads)
 	
+	manager = Manager()
+	proportion_sig_ints = manager.dict()
+	for size in ss_sizes:
+		proportion_sig_ints[size] = []
+	
 	print "Processing subsamples..."
-	proportion_sig_ints = process_subsamples(args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/",ss_sizes,chr_bins,chr_index,sig_matrix,num_sig_ints,probe_list)
+	process_subsamples(args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/",ss_sizes,probe_list,proportion_sig_ints,args.num_threads)
+	print proportion_sig_ints
+	print proportion_sig_ints.keys()
 	mean_proportion_sig_ints = {}
-	for key in proportion_sig_ints:
+	for key in proportion_sig_ints.keys():
 		mean_proportion_sig_ints[key] = sum(proportion_sig_ints[key])/float(args.num_iter)
 	print mean_proportion_sig_ints
 	
@@ -118,18 +130,19 @@ def generate_subsample(input):
 			curr_run += 1
 	file_out.close()
 		
-def process_subsamples(temp_dir,sizes,chr_bins,chr_index,sig_matrix,sig_ints,probe_list):
-	proportion_sig_ints = {} #Keeps track of the proportions for each iteration of each subsample size
-	for size in sizes:
-		proportion_sig_ints[size] = []
+def process_subsamples(temp_dir,sizes,probe_list,proportion_sig_ints,num_threads):
+	threadpool = Pool(num_threads)
 	for dir in os.listdir(temp_dir):
 		size = float(dir)
-		print "Processing " + dir + "..."
+		#print "Processing " + dir + "..."
 		for file in os.listdir(temp_dir + '/' + dir):
-			print "Processing " + file + "..."
+			input = [[temp_dir + '/' + dir + '/' + file,size,proportion_sig_ints]]
+			threadpool.map(process_file, input)
+			"""print "Processing " + file + "..."
 			hit = Set([]) #Keeps track of which significant interactions have been seen
 			sample = open(temp_dir + '/' + dir + '/' + file,'r')
 			for line in sample:
+				#hit = hit.union(process_line(line)) #If process_line returns a set, iteratively build on "hit"?
 				read = line.split('\t')
 				chr1 = "Chr" + read[2]
 				pos1 = read[3]
@@ -151,13 +164,80 @@ def process_subsamples(temp_dir,sizes,chr_bins,chr_index,sig_matrix,sig_ints,pro
 								if sig_matrix[index1][index2]:
 									hit.add(str(index1) + ',' + str(index2))
 									hit.add(str(index2) + ',' + str(index1)) #As this is equivalent
-			proportion_sig_ints[size].append((float(len(hit))/2.0)/float(sig_ints)) #Divide the number of hit significant interactions by two, as they were added "twice" to the set, then divide by the total number of significant interactions to get the proportion of significant interactions hit by the reads in this subsample"""
+			proportion_sig_ints[size].append((float(len(hit))/2.0)/float(sig_ints)) #Divide the number of hit significant interactions by two, as they were added "twice" to the set, then divide by the total number of significant interactions to get the proportion of significant interactions hit by the reads in this subsample
 			print hit
 			print "Hits:"
 			for tuple in hit:
 				print probe_list[int(tuple.split(',')[0])] + " " + probe_list[int(tuple.split(',')[1])]
-			sample.close()
-	return proportion_sig_ints
+			sample.close()"""
+	threadpool.close()
+	threadpool.join()
+
+def process_file(input):
+	file = input[0]
+	size = input[1]
+	proportion_sig_ints = input[2]
+	results = proportion_sig_ints[size]
+	#print "Processing " + file + "..."
+	hit = Set([]) #Keeps track of which significant interactions have been seen
+	sample = open(file,'r')
+	for line in sample:
+		read = line.split('\t')
+		chr1 = "Chr" + read[2]
+		pos1 = read[3]
+		if read[6] == '=':
+			chr2 = chr1
+		else:
+			chr2 = "Chr" + read[6]
+		pos2 = read[7]
+		if (chr_bins.has_key(chr1) and chr_bins.has_key(chr2)) and (chr_index.has_key(chr1) and chr_index.has_key(chr2)):
+			indices1 = search_bins(chr_bins[chr1],0,len(chr_bins[chr1])-1,int(pos1))
+			#print indices1
+			indices2 = search_bins(chr_bins[chr2],0,len(chr_bins[chr1])-1,int(pos2))
+			#print indices2
+			for index1 in indices1:
+				index1 += chr_index[chr1]
+				for index2 in indices2:
+					index2 += chr_index[chr2]
+					if not str(index1) + ',' + str(index2) in hit:
+						if sig_matrix[index1][index2]:
+							hit.add(str(index1) + ',' + str(index2))
+							hit.add(str(index2) + ',' + str(index1)) #As this is equivalent
+	#print "Appending value " + str((float(len(hit))/2.0)/float(num_sig_ints)) + " to proportion_sig_ints entry " + str(size)
+	results.append((float(len(hit))/2.0)/float(num_sig_ints)) #Divide the number of hit significant interactions by two, as they were added "twice" to the set, then divide by the total number of significant interactions to get the proportion of significant interactions hit by the reads in this subsample"""
+	proportion_sig_ints[size] = results
+	#print results
+	#print proportion_sig_ints
+	#print hit
+	#print "Hits:"
+	#for tuple in hit:
+		#print probe_list[int(tuple.split(',')[0])] + " " + probe_list[int(tuple.split(',')[1])]
+	sample.close()
+
+"""def process_line(line):
+	line_hits = Set([])
+	read = line.split('\t')
+	chr1 = "Chr" + read[2]
+	pos1 = read[3]
+	if read[6] == '=':
+		chr2 = chr1
+	else:
+		chr2 = "Chr" + read[6]
+	pos2 = read[7]
+	if (chr_bins.has_key(chr1) and chr_bins.has_key(chr2)) and (chr_index.has_key(chr1) and chr_index.has_key(chr2)):
+		indices1 = search_bins(chr_bins[chr1],0,len(chr_bins[chr1])-1,int(pos1))
+		print indices1
+		indices2 = search_bins(chr_bins[chr2],0,len(chr_bins[chr1])-1,int(pos2))
+		print indices2
+		for index1 in indices1:
+			index1 += chr_index[chr1]
+			for index2 in indices2:
+				index2 += chr_index[chr2]
+				if not str(index1) + ',' + str(index2) in hit:
+					if sig_matrix[index1][index2]:
+						line_hits.add(str(index1) + ',' + str(index2))
+						line_hits.add(str(index2) + ',' + str(index1)) #As this is equivalent
+	return line_hits"""
 
 def search_bins(bins,start,end,pos):
 	bin_index = start+((end-start)/2)
