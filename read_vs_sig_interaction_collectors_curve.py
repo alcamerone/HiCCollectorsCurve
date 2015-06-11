@@ -1,17 +1,23 @@
 import argparse
 import random
 import os
+from multiprocessing import Pool
 from sets import Set
+
+chr_index = {} #Links the chromosome identifier to the first index of a probe on this chromosome (i.e. the left-most probe of the chromosome)
+chr_bins = {} #Links the chromosome identifier to an ordered list of comma-separated tuples representing bins on the chromosome
+reads = [] #Stores the list of SAM reads
 
 def main(args):
 	#Build significance matrix
 	probes = open(args.probe_list_fp, 'r')
 	probes.readline() #Skip headers
 	probe_index = {} #Links probes to indices (used for building significance matrix quickly)
-	chr_index = {} #Links the chromosome identifier to the first index of a probe on this chromosome (i.e. the left-most probe of the chromosome)
-	chr_bins = {} #Links the chromosome identifier to an ordered list of comma-separated tuples representing bins on the chromosome
 	probe_list = [] #Simple list of probes for printing
 	chr_list = [] #Simple list of chromosomes (FOR TESTING)
+	global chr_index
+	global chr_bins
+	global reads
 	
 	print "Indexing probes..."
 	curr_chr = "" #The chromosome we are indexing currently
@@ -56,7 +62,8 @@ def main(args):
 	results = []
 	ss_sizes = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9]
 	print "Performing subsampling..."
-	subsample_sam(reads,ss_sizes,args.num_iter,args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/")
+	subsample_sam(ss_sizes,args.num_iter,args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/",args.num_threads)
+	
 	print "Processing subsamples..."
 	proportion_sig_ints = process_subsamples(args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/",ss_sizes,chr_bins,chr_index,sig_matrix,num_sig_ints,probe_list)
 	mean_proportion_sig_ints = {}
@@ -76,7 +83,8 @@ def main(args):
 		sig_matrix_test.write('\n')
 	sig_matrix_test.close()"""
 	
-def subsample_sam(reads,sizes,num_times,temp_dir): #num_times: the number of times to subsample the SAM file
+def subsample_sam(sizes,num_times,temp_dir,num_threads): #num_times: the number of times to subsample the SAM file
+	threadpool = Pool(num_threads)
 	if not os.path.exists(temp_dir):
 		print "Creating directory..."
 		os.mkdir(temp_dir)
@@ -88,13 +96,20 @@ def subsample_sam(reads,sizes,num_times,temp_dir): #num_times: the number of tim
 			os.mkdir(temp_sub_dir)
 			print "Directory created."
 		num_runs = int(size*len(reads)) #The number of lines to pull from the SAM file
-		for i in range(int(num_times)):
-			generate_subsample(temp_sub_dir,reads,num_runs,i,size)
+		for i in range(num_times):
+			input = [[temp_sub_dir,num_runs,str(i),str(size)]] #Convert inputs to generate_subsample to a list, so as to be compatible with Pool.map
+			threadpool.map(generate_subsample, input)
+	threadpool.close()
+	threadpool.join()
 
-def generate_subsample(temp_dir,reads,num_reads,run_num,size):
+def generate_subsample(input):
+	temp_dir = input[0]
+	num_reads = input[1]
+	run_num = input[2]
+	size = input[3]
 	seen = Set([]) #Keeps track of which lines have been seen
 	curr_run = 0
-	file_out = open(temp_dir + str(size) + "_subsample_" + str(run_num) + ".txt", 'w')
+	file_out = open(temp_dir + size + "_subsample_" + run_num + ".txt", 'w')
 	while curr_run < num_reads:
 		line_num = random.randint(0,len(reads)-1)
 		if not line_num in seen:
@@ -168,7 +183,8 @@ parser = argparse.ArgumentParser(description="")
 parser.add_argument("-p","--probe_list_fp")
 parser.add_argument("-i","--sig_ints_fp")
 parser.add_argument("-s","--sam_file_fp")
-parser.add_argument("-n","--num_iter",help="The number of subsamples to generate for each step")
+parser.add_argument("-n","--num_iter",help="The number of subsamples to generate for each step",type=int)
+parser.add_argument("-t","--num_threads",help="The number of concurrent processes to start (default: 2)",default=2,type=int)
 parser.add_argument("-k","--keep_subsample_files",help="Do not delete subsample files (default: False)",action="store_true",default="False")
 args = parser.parse_args()
 main(args)
