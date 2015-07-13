@@ -4,35 +4,44 @@ import random
 import os
 import shutil
 import multiprocessing
-from multiprocessing.pool import Pool
-from multiprocessing import Manager
+import numpy
+import ctypes
+from multiprocessing import Manager, Lock, Process
 from sets import Set
-from numpy import array, zeros, mean, std
+from numpy import array, mean, std
 from matplotlib import pyplot, style
 
 __author__ = "Cameron Ekblad"
 __email__ = "cekb635@aucklanduni.ac.nz"
 
+"""Workflow:
+- Create n*n significance matrix, where n is the number of probes, with all values default to zero
+- Populate said matrix by marking which interactions are considered "significant", by changing the values to 1
+- For each iteration of each sub-sample proportion:
+	- For the number of lines required to make up the iteration:
+		- Select a line at random from the original SAM read file
+		- Check to which probes the two reads belong
+		- Compare these to the significance matrix, to see if the interaction is considered "significant" or not
+		- If the interaction is signficant, store this information in a set of "hits"
+	- Take the number of hits and divide by the total number of reads to get a proportion. Store this in a dictionary
+	detailing the proportions achieved for each iteration of each sub-sample size
+- Find the mean and std. dev. of each sub-sample size across all iterations
+- Plot this information"""
+
 chr_index = {} #Links the chromosome identifier to the first index of a probe on this chromosome (i.e. the left-most probe of the chromosome)
 chr_bins = {} #Links the chromosome identifier to an ordered list of comma-separated tuples representing bins on the chromosome
-reads = [] #Stores the list of SAM reads
-sig_matrix = array([0])
+chr_bin_bsts = {} #Links the chromosome identifier to a binary search tree of the bins as defined above for fast, efficient searching with no recursion
 num_sig_ints = 0
-proportion_sig_ints = {} #Keeps track of the proportions for each iteration of each subsample size
 
 def main(args):
 	global chr_index
 	global chr_bins
-	global reads
-	global sig_matrix
+	global chr_bin_bsts
 	global num_sig_ints
 	
-	#Build significance matrix
 	probes = open(args.probe_list_fp, 'r')
 	probes.readline() #Skip headers
 	probe_index = {} #Links probes to indices (used for building significance matrix quickly)
-	probe_list = [] #Simple list of probes for printing
-	chr_list = [] #Simple list of chromosomes (FOR TESTING)
 	
 	print "Indexing probes..."
 	curr_chr = "" #The chromosome we are indexing currently
@@ -41,24 +50,60 @@ def main(args):
 		if curr_chr == "" or curr_chr != probe[1]:
 			curr_chr = probe[1]
 			chr_index[curr_chr] = index
-			chr_list.append(curr_chr)
 		probe_index[probe[0]] = index #Build index-probe dict
-		probe_list.append(probe[0])
 		if not chr_bins.has_key(curr_chr):
 			chr_bins[curr_chr] = [probe[2] + "," + probe[3]]
 		else:
 			chr_bins[curr_chr].append(probe[2] + "," + probe[3])
 	probes.close()
 	
+	manager = Manager()
+	#chr_bin_bsts_base = {}
+	
+	#Build binary search tree of chromosome bins
+	print "Building probe search trees..."
+	for key in chr_bins.keys(): #For the bin list of each chromosome
+		print "\tBuilding search tree for chromosome " + key
+		curr_chr_bins = chr_bins[key]
+		chr_bin_bsts[key] = BinBSTNode(None,curr_chr_bins[(len(curr_chr_bins)/2)],len(curr_chr_bins)/2) #Root the tree at the mid-way point
+		remaining_indices = range(0,len(curr_chr_bins)-1)
+		if len(remaining_indices) > 0:
+			remaining_indices.remove(len(curr_chr_bins)/2)
+		while len(remaining_indices) > 0: #While there are still bins left to be added
+			random_index = remaining_indices.pop(random.randint(0,len(remaining_indices)-1)) #Bins are added randomly to the list to try to avoid an unbalanced tree
+			curr_bin = curr_chr_bins[random_index]
+			curr_node = chr_bin_bsts[key]
+			while True: #Compare the node picked at random to the root
+				if int(curr_bin.split(',')[1]) < int(curr_node.bin.split(',')[0]):
+					if curr_node.left_child == None:
+						curr_node.left_child = BinBSTNode(curr_node,curr_bin,random_index)
+						break
+					else:
+						curr_node = curr_node.left_child
+						continue
+				else:
+					if curr_node.right_child == None:
+						curr_node.right_child = BinBSTNode(curr_node,curr_bin,random_index)
+						break
+					else:
+						curr_node = curr_node.right_child
+						continue
+	
+	#chr_bin_bsts = manager.dict(chr_bin_bsts_base)
+	#chr_bin_bsts_base = None
+	
 	print "Initialising significance matrix..."
-	sig_matrix = zeros((len(probe_index.keys()),len(probe_index.keys())))
+	sig_matrix_base = multiprocessing.Array(ctypes.c_short, len(probe_index.keys())**2,lock=False) #Significance matrix is stored in shared memory for efficiency
+	sig_matrix = numpy.frombuffer(sig_matrix_base,dtype=ctypes.c_short)
+	sig_matrix = sig_matrix.reshape(len(probe_index.keys()),len(probe_index.keys()))
 	
 	#Identify interactions as significant
 	sig_ints = open(args.sig_ints_fp, 'r')
 	print "Identifying significant interactions..."
 	sig_ints.readline()
 	for i,line in enumerate(sig_ints):
-		#print "Processing line " + str(i) + " of 2946230..."
+		if i % 10000 == 0:
+			print "Processing line " + str(i)
 		sig_int = line.strip().split('\t')
 		probe1 = sig_int[0]
 		probe2 = sig_int[4]
@@ -72,28 +117,50 @@ def main(args):
 	ss_sizes = []
 	for size in ss:
 		ss_sizes.append(float(size)/100.0)
-	#ss_sizes = [0.9] #FOR TESTING
-	manager = Manager()
 	proportion_sig_ints = manager.dict()
 	for size in ss_sizes:
 		proportion_sig_ints[size] = []
 	
 	#Perform sub-sampling and process sub-samples
+	print "Reading samples..."
 	sam_file = open(args.sam_file_fp, 'r')
+	pre_reads = []
 	line = sam_file.readline()
 	while line[0] == '@':
 		line = sam_file.readline()
-	reads = sam_file.readlines()
-	reads.insert(0,line)
+	read = line.split('\t')
+	pre_reads.append(read[2] + '\t' + read[3] + '\t' + read[6] + '\t' + read[7])
+	for line in sam_file:
+		read = line.split('\t')
+		pre_reads.append(read[2] + '\t' + read[3] + '\t' + read[6] + '\t' + read[7])
+	reads = multiprocessing.sharedctypes.Array(ctypes.c_char_p,pre_reads,lock=False) #Reads are also stored in shared memory for efficiency and speed
+	pre_reads = None
+	print "Finished reading samples, beginnning processing."
+	
+	threadpool = []
+	argqueue = []
 	for size in ss_sizes:
-		if not args.subsamples_already_exist:
-			subsample_sam(size,args.num_iter,args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/",args.num_threads)
-		process_subsample(args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/" + str(size) + '/',size,proportion_sig_ints,args.num_threads,args.num_iter)
-		#Delete temporary sub-sample files if desired
-		if not args.keep_subsample_files:
-			print "Deleting sub-sample " + str(size) + "..."
-			shutil.rmtree(args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/" + str(size))
-	reads = None #Unload reads from memory ASAP as this is likely a LARGE array
+		print "Processing proportion " + str(size) + " of reads."
+		lines_to_process = int(size*float(len(reads)))
+		for i in range(args.num_iter):
+			argqueue.append([sig_matrix,reads,size,lines_to_process,proportion_sig_ints,i])
+		while len(argqueue) > 0:
+			for j in range(args.num_threads):
+				if len(argqueue) > 0:
+					threadpool.append(Process(target=process_iteration, args=argqueue.pop(0)))
+					threadpool[-1].start()
+			for proc in threadpool:
+				proc.join()
+			threadpool = []
+	reads = None
+	
+	#Write proportion_sig_ints to file to be plotted later
+	proportion_sig_ints_fp = open(args.sig_ints_fp[:args.sig_ints_fp.rfind('.')] + "_proportion_sig_ints.txt",'w')
+	for key in proportion_sig_ints.keys():
+		proportion_sig_ints_fp.write(str(key) + '\n')
+		for val in proportion_sig_ints[key]:
+			proportion_sig_ints_fp.write(str(val) + ' ')
+		proportion_sig_ints_fp.write('\n')
 	
 	mean_proportion_sig_ints = {}
 	std_proportion_sig_ints = {}
@@ -101,8 +168,6 @@ def main(args):
 		tmp_array = array(proportion_sig_ints[key])
 		mean_proportion_sig_ints[key] = mean(tmp_array)
 		std_proportion_sig_ints[key] = std(tmp_array)
-	#print mean_proportion_sig_ints
-	#print std_proportion_sig_ints
 	
 	#Plot this information
 	print "Generating plot..."
@@ -112,179 +177,91 @@ def main(args):
 	error = []
 	for val in x:
 		y.append(mean_proportion_sig_ints[val])
-		error.append(std_proportion_sig_ints[val])
+		error.append(std_proportion_sig_ints[val]*2)
 	x.insert(0,0.0)
 	x.append(1.0)
 	y.insert(0,0.0)
 	y.append(1.0)
 	error.insert(0,0.0)
 	error.append(0.0)
-	pyplot.errorbar(x,y,yerr=error,marker='o')
-	pyplot.ylabel("Proportion of significant interactions hit")
 	pyplot.xlabel("Proportion of reads sub-sampled")
-	pyplot.savefig("collectors_curve.png",bbox_inches="tight")
-	
-	#Delete temporary sub-sample files if desired
-	if not args.keep_subsample_files:
-		print "Deleting temporary directory..."
-		shutil.rmtree(args.sam_file_fp[:args.sam_file_fp.rfind('/')+1] + "tmp/")
-	print "Done."
-	
-	"""sig_matrix_test = open("sig_matrix_test.txt",'w')
-	print "Writing test file..."
-	for probe in probe_list:
-		sig_matrix_test.write('\t' + probe)
-	sig_matrix_test.write('\n')
-	for row in range(0,len(probe_index.keys())):
-		sig_matrix_test.write(probe_list[row])
-		for col in range(0,len(probe_index.keys())):
-			sig_matrix_test.write('\t' + str(sig_matrix[row,col]))
-		sig_matrix_test.write('\n')
-	sig_matrix_test.close()"""
-	
-def subsample_sam(size,num_times,temp_dir,num_threads): #num_times: the number of times to subsample the SAM file
-	threadpool = Pool(num_threads)
-	if not os.path.exists(temp_dir):
-		os.mkdir(temp_dir)
-	print "Sub-sampling at depth " + str(size) + " of reads."
-	temp_sub_dir = temp_dir + str(size) + '/' #Include a subdirectory for each group of subsamples
-	if not os.path.exists(temp_sub_dir):
-		os.mkdir(temp_sub_dir)
-	num_runs = int(size*len(reads)) #The number of lines to pull from the SAM file
-	for i in range(num_times):
-		#input = [[temp_sub_dir,num_runs,str(i),str(size)]] #Convert inputs to generate_subsample to a list, so as to be compatible with Pool.map
-		#threadpool.map_async(generate_subsample, input)
-		threadpool.apply_async(generate_subsample, [temp_sub_dir,num_runs,str(i),str(size)])
-	threadpool.close()
-	threadpool.join()
+	pyplot.ylabel("Proportion of significant interactions hit")
+	pyplot.ylim(0.0,1.0)
+	pyplot.errorbar(x,y,yerr=error,marker='o')
+	pyplot.savefig("mem_efficient_collectors_curve.png",bbox_inches="tight")
 
-def generate_subsample(temp_dir,num_reads,run_num,size):
-	#temp_dir = input[0]
-	#num_reads = input[1]
-	#run_num = input[2]
-	#size = input[3]
-	seen = Set([]) #Keeps track of which lines have been seen
-	curr_run = 0
-	file_out = open(temp_dir + size + "_subsample_" + run_num + ".txt", 'w')
-	while curr_run < num_reads:
+
+def process_iteration(sig_matrix,reads,size,lines_to_process,proportion_sig_ints,i):
+	print "\tProcessing iteration " + str(i+1)
+	seen = Set([])
+	hits = []
+	lines_processed = 0
+	while lines_processed < lines_to_process: #For the number of lines to sample from the read file
 		line_num = random.randint(0,len(reads)-1)
 		if not line_num in seen:
 			seen.add(line_num)
-			file_out.write(reads[line_num])
-			curr_run += 1
-	file_out.close()
-		
-def process_subsample(temp_dir,size,proportion_sig_ints,num_threads,num_iter):
-	multiprocessing.log_to_stderr()
-	threadpool = LoggingPool(processes=num_threads)
-	print "Processing sub-samples of depth " + str(size) + "..."
-	for i,file in enumerate(os.listdir(temp_dir),start=1):
-		print "\tProcessing file " + str(i) + " of " + str(num_iter)
-		#input = [[temp_dir + file,size,proportion_sig_ints]]
-		#threadpool.map_async(process_file, input)
-		threadpool.apply_async(process_file, [temp_dir+file,size,proportion_sig_ints])
-	threadpool.close()
-	threadpool.join()
-
-def process_file(file,size,proportion_sig_ints):
-	#file = input[0]
-	#size = input[1]
-	#proportion_sig_ints = input[2]
-	#print "Processing " + file + "..."
-	hit = Set([]) #Keeps track of which significant interactions have been seen
-	sample = open(file,'r')
-	for i,line in enumerate(sample):
-		print "\t\tProcessing line " + str(i) + " of 25995747\n\t\tSplitting line up on tabs..."
-		read = line.split('\t')
-		print "\t\tAssigning chromosome 1..."
-		chr1 = read[2]
-		print "\t\tAssigning position 1..."
-		pos1 = read[3]
-		print "\t\tAssigning chromosome 2..."
-		if read[6] == '=':
-			chr2 = chr1
-		else:
-			chr2 = read[6]
-		print "\t\tAssigning position 2..."
-		pos2 = read[7]
-		print "Chr1: " + chr1 + " Pos1: " + pos1 + " Chr2: " + chr2 + " Pos2: " + pos2
-		if (chr_bins.has_key(chr1) and chr_bins.has_key(chr2)) and (chr_index.has_key(chr1) and chr_index.has_key(chr2)):
-			print "Check passed."
-			indices1 = search_bins(chr_bins[chr1],0,len(chr_bins[chr1])-1,int(pos1))
-			print indices1
-			indices2 = search_bins(chr_bins[chr2],0,len(chr_bins[chr1])-1,int(pos2))
-			print indices2
-			for index1 in indices1:
-				index1 += chr_index[chr1]
-				for index2 in indices2:
-					index2 += chr_index[chr2]
-					if not str(index1) + ',' + str(index2) in hit:
+			read = reads[line_num].split('\t')
+			chr1 = read[0]
+			pos1 = read[1]
+			if read[2] == '=':
+				chr2 = chr1
+			else:
+				chr2 = read[2]
+			pos2 = read[3]
+			if (chr_bins.has_key(chr1) and chr_bins.has_key(chr2)) and (chr_index.has_key(chr1) and chr_index.has_key(chr2)):
+				indices1 = search_bins(chr1,int(pos1),sig_matrix) #Binary search through the chromosome bin indices to find which probe the read belongs to
+				indices2 = search_bins(chr2,int(pos2),sig_matrix)
+				for index1 in indices1:
+					index1 += chr_index[chr1]
+					for index2 in indices2:
+						index2 += chr_index[chr2]
 						if sig_matrix[index1,index2] == 1:
-							hit.add(str(index1) + ',' + str(index2))
-							hit.add(str(index2) + ',' + str(index1)) #As this is equivalent
-							print hit
-	print "Appending value " + str((float(len(hit))/2.0)/float(num_sig_ints)) + " to proportion_sig_ints entry " + str(size)
+							hits.append(str(index1) + ',' + str(index2))
+							hits.append(str(index2) + ',' + str(index1))
+			lines_processed += 1
+	sig_ints_hit = set(hits)
 	results = proportion_sig_ints[size]
-	results.append((float(len(hit))/2.0)/float(num_sig_ints)) #Divide the number of hit significant interactions by two, as they were added "twice" to the set, then divide by the total number of significant interactions to get the proportion of significant interactions hit by the reads in this subsample"""
+	results.append((float(len(sig_ints_hit))/2.0)/float(num_sig_ints)) #Divide the number of hit significant interactions by two, as they were added "twice" to the set, then divide by the total number of significant
+	#																    interactions to get the proportion of significant interactions hit by the reads in this subsample
 	proportion_sig_ints[size] = results
-	#print results
-	print proportion_sig_ints[size]
-	#print hit
-	#print "Hits:"
-	#for tuple in hit:
-		#print probe_list[int(tuple.split(',')[0])] + " " + probe_list[int(tuple.split(',')[1])]
-	sample.close()
 
-def search_bins(bins,start,end,pos):
-	bin_index = start+((end-start)/2)
-	bin = bins[bin_index].split(',')
-	print "Searching for value " + str(pos) + " in bin " + str(bin)
-	if pos >= int(bin[0]) and pos <= int(bin[1]):
-		result = [bin_index]
-		if not bin_index == 0:
-			adj_bin = bins[bin_index-1].split(',')	#Due to the overlapping nature of the bins, every read will hit either the previous or the next bin as well as the first found bin
-			if pos >= int(adj_bin[0]) and pos <= int(adj_bin[1]):
-				result.append(bin_index-1)
-		if not bin_index == len(bins)-1:
-			adj_bin = bins[bin_index+1].split(',')
-			if pos >= int(adj_bin[0]) and pos <= int(adj_bin[1]):
-				result.append(bin_index+1)
-		return result
-	elif pos < int(bin[0]):
-		print "Too big, going smaller."
-		return search_bins(bins,start,bin_index,pos)
-	elif pos > int(bin[1]):
-		print "Too small, going bigger."
-		return search_bins(bins,bin_index+1,end,pos)
+def search_bins(chr,pos,sig_matrix): #This method performs a binary search through the binary search tree generated earlier to map the SAM read to zero or more probes
+	curr_node = chr_bin_bsts[chr]
+	result = []
+	while True:
+		if pos >= int(curr_node.bin.split(',')[0]) and pos <= int(curr_node.bin.split(',')[1]): #If the read belongs to this probe
+			result.append(curr_node.index) #Add the probe to the results
+			if not curr_node.index == 0:
+				adj_bin = chr_bins[chr][curr_node.index-1].split(',')	#Due to the potentially overlapping nature of the bins, every read may hit either the previous or the next bin as well as the first found bin
+				if pos >= int(adj_bin[0]) and pos <= int(adj_bin[1]):	#This code checks these bins
+					result.append(curr_node.index-1)
+			if not curr_node.index == len(chr_bins[chr])-1:
+				adj_bin = chr_bins[chr][curr_node.index+1].split(',')
+				if pos >= int(adj_bin[0]) and pos <= int(adj_bin[1]):
+					result.append(curr_node.index+1)
+			return result
+		elif pos < int(curr_node.bin.split(',')[0]): #If the read start is smaller than the smaller value of the probe
+			if curr_node.left_child == None: #If the probe has no left child in the search tree
+				return result #Return nothing - this read does not map to a probe
+			else:
+				curr_node = curr_node.left_child #Otherwise, continue the search from the smaller child of the current probe
+		elif pos > int(curr_node.bin.split(',')[1]): #As above, but if the read start is larger than the larger value of the probe
+			if curr_node.right_child == None:
+				return result
+			else:
+				curr_node = curr_node.right_child
 
-def error(msg, *args):
-    return multiprocessing.get_logger().error(msg, *args)
 
-class LogExceptions(object):
-    def __init__(self, callable):
-        self.__callable = callable
-        return
-
-    def __call__(self, *args, **kwargs):
-        try:
-            result = self.__callable(*args, **kwargs)
-
-        except Exception as e:
-            # Here we add some debugging help. If multiprocessing's
-            # debugging is on, it will arrange to log the traceback
-            error(traceback.format_exc())
-            # Re-raise the original exception so the Pool worker can
-            # clean up
-            raise
-
-        # It was fine, give a normal answer
-        return result
-    pass
-
-class LoggingPool(Pool):
-    def apply_async(self, func, args=(), kwds={}, callback=None):
-        return Pool.apply_async(self, LogExceptions(func), args, kwds, callback)
-
+class BinBSTNode:
+	'The common class for all nodes in the binary search tree containing all chromosome bins. Each node is associated with a bin (interval) given as a comma-separated tuple, and an index\
+	in the significance matrix, as well as a parent node and a left and right child node.'
+		
+	def __init__(self,parent,bin,index):
+		self.parent = parent
+		self.bin = bin
+		self.index = index
+		self.left_child = None
+		self.right_child = None
 
 
 parser = argparse.ArgumentParser(description="Generates a collectors curve to determine completeness of significant interactions sampled. Requires:\
@@ -298,7 +275,5 @@ parser.add_argument("-s","--sam_file_fp",help="The path to the SAM file used to 
 parser.add_argument("-z","--step_size",help="The step-size to increase the proportion of reads sub-sampled by each iteration (default: 0.1)",type=float,default=0.1)
 parser.add_argument("-n","--num_iter",help="The number of subsamples to generate for each step",type=int,default=100)
 parser.add_argument("-t","--num_threads",help="The number of concurrent processes to start (default: 2)",type=int,default=2)
-parser.add_argument("-k","--keep_subsample_files",help="Do not delete subsample files (default: False)",action="store_true",default=False)
-parser.add_argument("-x","--subsamples_already_exist",help="Sub-samples have already been generated by this script and stored, no need to generate new ones (saves processing time) (default: False)",action="store_true",default=False)
 args = parser.parse_args()
 main(args)
